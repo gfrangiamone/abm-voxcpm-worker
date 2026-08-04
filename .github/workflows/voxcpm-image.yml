@@ -51,16 +51,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Un solo tag qui. Spingere piu' tag dallo stesso step significa piu'
+      # push di manifest a distanza di millisecondi, che GHCR respinge con un
+      # rate limit secondario (403): e' successo al primo build, con
+      # l'immagine gia' pubblicata ma il workflow segnato come fallito.
       - name: Build e push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           provenance: false
-          tags: |
+          tags: ${{ env.IMAGE }}:latest
+
+      # Alias per tracciabilita' e rollback. Volutamente in uno step separato,
+      # distanziato nel tempo e NON bloccante: se GHCR rate-limita di nuovo,
+      # l'immagine e' comunque pubblicata e il build non va marcato fallito.
+      - name: Alias con lo SHA del commit
+        continue-on-error: true
+        run: |
+          sleep 45
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${{ github.sha }} \
+            ${{ inputs.tag != '' && format('-t {0}:{1}', env.IMAGE, inputs.tag) || '' }} \
             ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ inputs.tag != '' && format('{0}:{1}', env.IMAGE, inputs.tag) || '' }}
 
       - name: Riepilogo
         run: |

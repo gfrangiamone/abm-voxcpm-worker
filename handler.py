@@ -32,6 +32,7 @@ import hashlib
 import io
 import os
 import re
+import threading
 import time
 import wave
 
@@ -61,28 +62,53 @@ LATENT_CACHE_MAX = int(os.environ.get("ABM_VOXCPM_LATENT_CACHE", "32"))
 
 _POOL = None
 _LOOP = None
+_LOOP_THREAD = None
 _SAMPLE_RATE = SAMPLE_RATE_FALLBACK
 _LATENT_CACHE = {}
+# L'handler puo' essere invocato da piu' thread se l'endpoint accetta piu' job
+# in parallelo: senza lock due chiamate contemporanee creerebbero due loop o
+# due pool, e il secondo pool non troverebbe VRAM libera.
+# RLock e non Lock: _pool() lo tiene mentre chiama _await(), che a sua volta lo
+# riprende per creare il loop — con un Lock semplice sarebbe uno stallo.
+_INIT_LOCK = threading.RLock()
 
 
-def _loop():
-    """Event loop unico: il pool resta legato a quello in cui e' nato."""
-    global _LOOP
+def _await(coro):
+    """Esegue una coroutine sul loop dedicato e ne attende l'esito.
+
+    Il worker RunPod invoca l'handler DENTRO un event loop gia' in esecuzione:
+    un run_until_complete qui dentro solleva "Cannot run the event loop while
+    another loop is running" — misurato sul campo, non teorico.
+
+    Il loop vive quindi in un thread suo e resta acceso fra una chiamata e
+    l'altra. Non e' solo un rimedio all'errore: il pool registra i propri task
+    di background (lo scheduler del batching continuo) sul loop in cui nasce,
+    e con run_until_complete quel loop girerebbe solo durante le singole
+    chiamate — cioe' il batching su cui regge tutto il conto economico non
+    avrebbe mai modo di lavorare.
+    """
+    global _LOOP, _LOOP_THREAD
     if _LOOP is None:
-        _LOOP = asyncio.new_event_loop()
-        asyncio.set_event_loop(_LOOP)
-    return _LOOP
+        with _INIT_LOCK:
+            if _LOOP is None:
+                loop = asyncio.new_event_loop()
+                _LOOP_THREAD = threading.Thread(
+                    target=loop.run_forever, name="voxcpm-loop", daemon=True)
+                _LOOP_THREAD.start()
+                _LOOP = loop
+    return asyncio.run_coroutine_threadsafe(coro, _LOOP).result()
 
 
-def _pool():
-    """Costruisce il pool al primo uso e lo riusa (worker caldo)."""
-    global _POOL, _SAMPLE_RATE
-    if _POOL is not None:
-        return _POOL
-    t0 = time.time()
+async def _build_pool():
+    """Costruisce il pool DENTRO il loop dedicato.
+
+    La costruzione avviene qui e non nel chiamante perche' il pool registra i
+    propri task di background sul loop attivo al momento della creazione: se
+    nascesse sul loop dell'handler, quei task morirebbero con la chiamata.
+    """
     try:
         from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2ServerPool
-        _POOL = AsyncVoxCPM2ServerPool(
+        pool = AsyncVoxCPM2ServerPool(
             model_path=MODEL_PATH,
             inference_timesteps=TIMESTEPS,
             max_num_seqs=MAX_NUM_SEQS,
@@ -91,19 +117,37 @@ def _pool():
         )
     except ImportError:
         from nanovllm_voxcpm import VoxCPM
-        _POOL = VoxCPM.from_pretrained(
+        pool = VoxCPM.from_pretrained(
             model=MODEL_PATH,
             inference_timesteps=TIMESTEPS,
             max_num_seqs=MAX_NUM_SEQS,
             gpu_memory_utilization=GPU_MEM_UTIL,
             devices=[0],
         )
-    _loop().run_until_complete(_POOL.wait_for_ready())
-    try:
-        info = _loop().run_until_complete(_POOL.get_model_info())
-        _SAMPLE_RATE = int(getattr(info, "sample_rate", SAMPLE_RATE_FALLBACK))
-    except Exception:  # noqa: BLE001 — non bloccante
-        _SAMPLE_RATE = SAMPLE_RATE_FALLBACK
+    # Il ripiego VoxCPM.from_pretrained quasi certamente non espone
+    # wait_for_ready: e' un'API del pool asincrono, non del wrapper sincrono.
+    waiter = getattr(pool, "wait_for_ready", None)
+    if waiter is not None:
+        await waiter()
+    return pool
+
+
+def _pool():
+    """Costruisce il pool al primo uso e lo riusa (worker caldo)."""
+    global _POOL, _SAMPLE_RATE
+    if _POOL is not None:
+        return _POOL
+    with _INIT_LOCK:
+        if _POOL is not None:
+            return _POOL
+        t0 = time.time()
+        pool = _await(_build_pool())
+        try:
+            info = _await(pool.get_model_info())
+            _SAMPLE_RATE = int(getattr(info, "sample_rate", SAMPLE_RATE_FALLBACK))
+        except Exception:  # noqa: BLE001 — non bloccante
+            _SAMPLE_RATE = SAMPLE_RATE_FALLBACK
+        _POOL = pool
     print(f"[worker] pool pronto in {time.time() - t0:.1f}s  "
           f"timesteps={TIMESTEPS}  sample_rate={_SAMPLE_RATE}", flush=True)
     return _POOL
@@ -207,7 +251,7 @@ def _encode_cached(raw, fmt):
     hit = _LATENT_CACHE.get(key)
     if hit is not None:
         return hit, True
-    latents = _loop().run_until_complete(_pool().encode_latents(raw, fmt))
+    latents = _await(_pool().encode_latents(raw, fmt))
     if len(_LATENT_CACHE) >= LATENT_CACHE_MAX:
         _LATENT_CACHE.pop(next(iter(_LATENT_CACHE)))
     _LATENT_CACHE[key] = latents
@@ -255,7 +299,7 @@ def _action_encode_voice(inp):
     raw = base64.b64decode(inp["wav_b64"])
     fmt = inp.get("wav_format", "wav")
     t0 = time.time()
-    latents = _loop().run_until_complete(_pool().encode_latents(raw, fmt))
+    latents = _await(_pool().encode_latents(raw, fmt))
     return {
         "voice_latents": base64.b64encode(latents).decode("ascii"),
         "bytes": len(latents),
@@ -313,7 +357,7 @@ def _action_generate(inp):
         await asyncio.gather(*(_one(i, c, sem) for i, c in enumerate(chunks)))
 
     t0 = time.time()
-    _loop().run_until_complete(_run())
+    _await(_run())
     tts_seconds = time.time() - t0
 
     pcm = _to_pcm16(np.concatenate(results, axis=0))
