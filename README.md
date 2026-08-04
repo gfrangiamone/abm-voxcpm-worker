@@ -1,12 +1,7 @@
 # Worker RunPod Serverless — VoxCPM2 / nanovllm
 
 Endpoint GPU per la sintesi VoxCPM2, pensato per affiancare le voci premium
-di [audiobook-maker](https://github.com/gfrangiamone/audiobook-maker), non per
-sostituire edge-tts.
-
-Repo separato di proposito: in `audiobook-maker` ogni push su `main` fa
-partire il deploy in produzione, e sperimentare su questo worker non deve
-poter toccare un servizio attivo.
+di [audiobook-maker](https://github.com/gfrangiamone/audiobook-maker).
 
 ## Cosa NON e' ancora verificato
 
