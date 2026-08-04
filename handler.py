@@ -610,4 +610,14 @@ async def handler(job):
     return await asyncio.get_running_loop().run_in_executor(None, _handle, job)
 
 
-runpod.serverless.start({"handler": handler})
+# Il guard non e' una formalita': e' obbligatorio qui.
+# AsyncVoxCPM2ServerPool avvia i propri server in processi separati con il
+# metodo "spawn" (popen_spawn_posix). Spawn RE-IMPORTA il modulo __main__ nel
+# figlio, e __main__ e' questo file (CMD python -u /app/handler.py). Senza
+# guard il figlio rieseguiva runpod.serverless.start diventando un SECONDO
+# worker RunPod nello stesso container: prendeva un job, tentava di costruire
+# a sua volta il pool e multiprocessing sollevava _check_not_importing_main.
+# Misurato: e' la causa delle morti silenziose del worker fra i 50 e i 90s.
+# Nel figlio il modulo si chiama "__mp_main__", quindi il guard lo esclude.
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
