@@ -1,0 +1,73 @@
+# Costruisce e pubblica su GHCR l'immagine del worker RunPod Serverless
+# (VoxCPM2 su motore nanovllm-voxcpm).
+#
+# Perche' in CI e non in locale: l'immagine finale supera i 10 GB. Costruita
+# qui, il push resta dentro il datacenter GitHub; da una postazione di lavoro
+# sarebbe un upload di ore.
+#
+# Repo separato da audiobook-maker apposta: li' ogni push su main fa partire
+# il deploy in produzione, e sperimentare sul worker non deve poter toccare
+# un servizio attivo.
+name: VoxCPM worker image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag aggiuntivo da applicare all'immagine (es. 1)"
+        required: false
+        default: ""
+  push:
+    branches: [main]
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/abm-voxcpm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Il runner parte con ~25 GB liberi: l'immagine (base 3,75 GB + pesi
+      # ~5 GB + flash-attn) li satura. Questi pacchetti preinstallati non
+      # servono a nulla qui e liberano ~25 GB.
+      - name: Libera spazio su disco
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android \
+                      /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -af
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build e push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+            ${{ inputs.tag != '' && format('{0}:{1}', env.IMAGE, inputs.tag) || '' }}
+
+      - name: Riepilogo
+        run: |
+          echo "### Immagine pubblicata" >> $GITHUB_STEP_SUMMARY
+          echo '`${{ env.IMAGE }}:latest`' >> $GITHUB_STEP_SUMMARY
+          echo '`${{ env.IMAGE }}:${{ github.sha }}`' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Al PRIMO push il package GHCR nasce privato: renderlo pubblico" \
+               "da Packages > abm-voxcpm > Package settings, altrimenti RunPod" \
+               "non riesce a scaricarlo." >> $GITHUB_STEP_SUMMARY

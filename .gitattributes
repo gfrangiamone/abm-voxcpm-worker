@@ -1,0 +1,7 @@
+# Tutto viene eseguito dentro un container Linux: i fine riga CRLF romperebbero
+# l'heredoc di shell nel Dockerfile e gli script del workflow, con errori di
+# build poco leggibili. Forzati a LF a prescindere dalla piattaforma di lavoro.
+* text=auto eol=lf
+*.wav binary
+*.mp3 binary
+*.m4b binary
