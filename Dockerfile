@@ -14,10 +14,12 @@
 # Il prezzo e' il container disk (~0,10 USD/GB/mese).
 FROM pytorch/pytorch:2.8.0-cuda12.6-cudnn9-runtime
 
+# HF_HUB_ENABLE_HF_TRANSFER e' deprecato e non ha piu' effetto: huggingface_hub
+# emette un FutureWarning a ogni import, che finiva nello stdout catturato dalle
+# sonde diagnostiche. Rimosso perche' e' rumore, non funzionalita'.
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/opt/hf \
-    HF_HUB_ENABLE_HF_TRANSFER=1
+    HF_HOME=/opt/hf
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ffmpeg curl ca-certificates \
@@ -51,8 +53,28 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # Pesi nell'immagine: e' questo che rende il cold start accettabile.
 ARG VOXCPM_MODEL=openbmb/VoxCPM2
-RUN python -c "from huggingface_hub import snapshot_download; \
-snapshot_download('${VOXCPM_MODEL}')"
+# Retry con backoff: HuggingFace rate-limita i download anonimi (429 misurato
+# dopo alcune build ravvicinate) e senza ritentativo l'intero workflow muore
+# a valle di 5 minuti di lavoro gia' fatto. La cache dei layer in CI riduce la
+# frequenza di questo step, non lo elimina.
+RUN python - "$VOXCPM_MODEL" <<'PY'
+import sys, time
+from huggingface_hub import snapshot_download
+repo = sys.argv[1]
+for i in range(7):
+    try:
+        print("pesi in", snapshot_download(repo), flush=True)
+        break
+    except Exception as e:
+        if i == 6:
+            raise
+        # Tetto a 10 minuti: il rate limit HF si e' visto durare piu' di
+        # qualche minuto, e il tempo di CI su repo pubblico non si paga.
+        wait = min(600, 60 * 2 ** i)
+        print(f"tentativo {i+1} fallito ({type(e).__name__}: {e}); "
+              f"riprovo fra {wait}s", flush=True)
+        time.sleep(wait)
+PY
 ENV ABM_VOXCPM_MODEL=${VOXCPM_MODEL}
 
 # Un endpoint = una configurazione di qualita': i timesteps sono un parametro

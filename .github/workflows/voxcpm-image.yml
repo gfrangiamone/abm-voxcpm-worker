@@ -55,6 +55,13 @@ jobs:
       # push di manifest a distanza di millisecondi, che GHCR respinge con un
       # rate limit secondario (403): e' successo al primo build, con
       # l'immagine gia' pubblicata ma il workflow segnato come fallito.
+      # cache-from sull'immagine gia' pubblicata + cache-to inline: senza, ogni
+      # push riscarica i ~5 GB di pesi da HuggingFace, perche' il runner e'
+      # effimero. Quattro build ravvicinate sono bastate a farci rate-limitare
+      # (429 sull'API HF) e a far fallire il workflow. Con la cache il layer dei
+      # pesi viene riusato e solo COPY handler.py in poi viene ricostruito.
+      # Inline richiede provenance: false, gia' impostato: le attestazioni
+      # renderebbero il manifest incompatibile con la cache inline.
       - name: Build e push
         uses: docker/build-push-action@v6
         with:
@@ -62,6 +69,8 @@ jobs:
           push: true
           provenance: false
           tags: ${{ env.IMAGE }}:latest
+          cache-from: type=registry,ref=${{ env.IMAGE }}:latest
+          cache-to: type=inline
 
       # Alias per tracciabilita' e rollback. Volutamente in uno step separato,
       # distanziato nel tempo e NON bloccante: se GHCR rate-limita di nuovo,
