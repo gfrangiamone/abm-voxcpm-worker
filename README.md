@@ -3,24 +3,40 @@
 Endpoint GPU per la sintesi VoxCPM2, pensato per affiancare le voci premium
 di [audiobook-maker](https://github.com/gfrangiamone/audiobook-maker).
 
-## Cosa NON e' ancora verificato
+## Stato: verificato su GPU
 
-Niente di quanto segue e' stato eseguito: questa macchina non ha GPU NVIDIA.
-Il codice e' validato solo sintatticamente. I punti che quasi certamente
-richiederanno una correzione al primo build reale:
+Girato end-to-end su RTX 4090 il 2026-08-04. Numeri misurati, non stimati:
 
-1. **Percorso di import di `nanovllm_voxcpm`** — l'handler prova
-   `nanovllm_voxcpm.models.voxcpm2.server.AsyncVoxCPM2ServerPool` e ripiega su
-   `nanovllm_voxcpm.VoxCPM.from_pretrained`.
-2. **Firma di `generate()`** — i nomi dei parametri (`target_text`,
-   `ref_audio_latents`, `prompt_latents`, `cfg_value`) sono presi dalla
-   documentazione del progetto, non verificati contro il codice installato.
-3. **Tipo restituito da `generate()`** — `Waveform` non e' documentato;
-   `_to_array()` accetta ndarray, tensori torch e wrapper con l'audio in un
-   attributo, ma potrebbe non coprire il caso reale.
-4. **`sample_rate` da `get_model_info()`** — se l'attributo ha un altro nome si
-   ricade su 48000. Un disallineamento qui non da' errore: produce audio a
-   velocita' sbagliata.
+| | Valore |
+|---|---|
+| Caricamento modello + warmup `torch.compile` | 37,3 s |
+| Cold start completo (pull immagine + avvio + build) | ~180 s |
+| `sample_rate` | 48000 |
+| Throughput, 11 919 char / 51 chunk / concorrenza 16 | **28,5x realtime** |
+| Throughput, 749 char / 3 chunk | 16,2x realtime |
+| Chunk falliti | 0 |
+| Costo su RTX 4090 a $1.10/h | **~$0,91 / 1M char** |
+
+I 57-92x realtime ipotizzati in fase di stima **non** sono stati raggiunti. Il
+conto economico regge lo stesso (Speechify sta a $11,18 / 1M char), ma sotto le
+~10-15 richieste in volo il batching continuo non si satura: capitoli corti
+costano proporzionalmente di piu'.
+
+Tre difetti trovati e corretti solo grazie all'esecuzione reale, tutti fatali e
+nessuno visibile in locale:
+
+1. **`spawn` re-importa `__main__`** — il pool avvia i propri server con
+   `multiprocessing`, il figlio rieseguiva `runpod.serverless.start()` e
+   diventava un secondo worker nello stesso container. Il processo moriva in
+   silenzio fra i 50 e i 90 secondi. Da qui il guard `if __name__ ==
+   "__main__"` in fondo a `handler.py`, che non e' una formalita'.
+2. **`model_path` vuole una directory, non un repo id** —
+   `VoxCPM2ServerImpl` fa `os.path.join(model_path, "config.json")`.
+3. **Servono `gcc`/`g++` nell'immagine** — il motore usa `torch.compile` e
+   Inductor compila i kernel Triton a runtime, al warmup.
+
+Restano non verificati: il comportamento su tier GPU diversi dalla 4090 e la
+fatturazione del container disk a endpoint fermo.
 
 ## Build e push: da GitHub Actions, non in locale
 
@@ -80,8 +96,11 @@ Authorization: Bearer <RUNPOD_API_KEY>
 | `ABM_VOXCPM_TIMESTEPS` | `10` | **costruttore**: un endpoint = una qualita' |
 | `ABM_VOXCPM_CONCURRENCY` | `16` | default se il job non lo specifica |
 | `ABM_VOXCPM_CFG` | `2.0` | aderenza al testo/riferimento |
-| `ABM_VOXCPM_MAX_INLINE_BYTES` | `6000000` | oltre questa soglia serve S3 |
-| `ABM_S3_ENDPOINT` / `ABM_S3_BUCKET` / `ABM_S3_ACCESS_KEY` / `ABM_S3_SECRET_KEY` / `ABM_S3_REGION` | — | riusabili quelli del cold storage R2 |
+| `ABM_VOXCPM_MAX_INLINE_BYTES` | `6000000` | ~60 s di audio; oltre serve S3 |
+| `ABM_VOXCPM_S3_PREFIX` | `voxcpm` | prefisso delle chiavi generate dal worker |
+| `ABM_VOXCPM_S3_PUT_ATTEMPTS` | `3` | tentativi sulla presigned PUT (mai sui 4xx) |
+| `ABM_S3_PRESIGN_TTL_SEC` | `21600` | durata della presigned GET restituita |
+| `ABM_S3_ENDPOINT` / `ABM_S3_BUCKET` / `ABM_S3_ACCESS_KEY` / `ABM_S3_SECRET_KEY` / `ABM_S3_REGION` / `ABM_S3_KEY_PREFIX` | — | riusabili quelli del cold storage R2. `ABM_S3_REGION` = `auto` per R2 |
 
 ## Unita' di lavoro: un job = un capitolo
 
@@ -136,7 +155,7 @@ uscire.
   "max_chars": 300,
   "concurrency": 16,
   "output_format": "wav",
-  "s3": {"key": "jobs/<job_id>/ch001.wav"}
+  "s3": {"put_url": "<presigned PUT firmata dal chiamante>"}
 }}
 ```
 
@@ -150,7 +169,39 @@ uscire.
 | `max_chars` | `300` | usato solo con `text` |
 | `concurrency` | `16` | chunk in volo insieme |
 | `output_format` | `wav` | `wav` o `pcm` |
-| `s3.key` | — | senza, l'audio torna inline in `audio_b64` sotto i 6 MB |
+| `s3` | — | consegna dell'audio, vedi sotto |
+
+### Consegna dell'audio: inline solo per le prove
+
+Il ritorno inline in `audio_b64` copre **circa 60 secondi** di audio
+(`MAX_INLINE_BYTES` / 96 kB/s a 48 kHz mono 16 bit). Un capitolo vero ne fa
+dieci-venti volte tanto: serve S3.
+
+| Modo | Campo | Quando |
+|---|---|---|
+| **presigned PUT** | `s3.put_url` | **produzione.** Il chiamante firma con `storage_backend.presigned_put_url()` e passa solo l'URL. Il worker non riceve nessuna credenziale |
+| credenziali | `ABM_S3_*` sull'endpoint, o `s3.{endpoint_url,access_key,secret_key,bucket,region,key_prefix}` | quando serve la chiave generata dal worker o una presigned GET di ritorno |
+| inline | nessuno | prove manuali, sotto i 6 MB |
+
+Con `put_url` la risposta contiene `s3.mode = "put_url"` e i byte caricati;
+**l'URL firmato non viene rimandato indietro** (lo conosce gia' chi l'ha
+generato, e contiene una firma di scrittura).
+
+Con le credenziali la risposta contiene anche `s3.url`, una presigned **GET**
+valida `ABM_S3_PRESIGN_TTL_SEC` secondi: senza, il chiamante riceverebbe una
+chiave che non puo' leggere. Se `s3.key` manca, il worker la genera come
+`<ABM_VOXCPM_S3_PREFIX>/<job_id>.wav` e segnala `s3_key_generated: true`.
+
+Preferire `put_url`: le credenziali passate nel corpo della richiesta restano
+memorizzate nel record del job lato RunPod. In nessun caso le credenziali
+compaiono nella risposta.
+
+Verifica della configurazione **senza spendere GPU** — put/head/presign/delete
+di un oggetto da 16 byte:
+
+```json
+{"input": {"action": "diag", "s3_check": true}}
+```
 
 `timesteps` **non** e' un parametro di chiamata: e' del costruttore del pool.
 Cambiarlo significa un endpoint diverso.
@@ -162,11 +213,11 @@ al worker e' un ripiego per l'uso manuale.
 Risposta:
 
 ```json
-{"sample_rate": 48000, "timesteps": 10, "concurrency": 16, "chunks": 2,
- "max_chars": 300, "voice_from_cache": false, "failed_indices": [],
- "chars": 518, "tts_seconds": 12.4, "audio_seconds": 29.8,
- "throughput_x_realtime": 2.4, "format": "wav",
- "s3": {"bucket": "...", "key": "..."}}
+{"sample_rate": 48000, "timesteps": 10, "concurrency": 16, "chunks": 51,
+ "max_chars": 300, "voice_from_cache": true, "failed_indices": [],
+ "chars": 11919, "tts_seconds": 25.78, "audio_seconds": 733.76,
+ "throughput_x_realtime": 28.46, "format": "wav", "bytes": 70441004,
+ "s3": {"mode": "put_url", "status": 200, "bytes": 70441004}}
 ```
 
 Prova minima da PowerShell:

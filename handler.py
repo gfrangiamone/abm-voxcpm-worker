@@ -25,6 +25,26 @@ VOCE DI RIFERIMENTO — due modi, entrambi accettati
        di voci precaricate.
     I latenti sono comunque tenuti in cache per hash del campione: su worker
     caldo lo stesso WAV non viene ricodificato.
+
+CONSEGNA DELL'AUDIO — inline solo per le prove, S3 per i capitoli veri
+    Il ritorno inline in base64 copre circa 60 secondi di audio
+    (MAX_INLINE_BYTES / 96 kB/s a 48 kHz mono 16 bit): un capitolo vero ne fa
+    dieci-venti volte tanto. Sopra la soglia l'audio va su S3/R2 e nella
+    risposta torna un URL.
+
+    Due modi, in ordine di preferenza:
+    1. `s3.put_url` — il CHIAMANTE firma una presigned PUT (l'app ha gia'
+       storage_backend.presigned_put_url) e passa solo quell'URL. Il worker
+       non riceve alcuna credenziale: se il payload del job venisse letto da
+       terzi, esporrebbe un permesso di scrittura su una singola chiave e a
+       scadenza, non le chiavi del bucket. E' il modo con cui deve girare la
+       produzione.
+    2. Credenziali complete, dalle ABM_S3_* dell'ENDPOINT o — sconsigliato —
+       dai campi della richiesta. Serve quando si vuole la chiave generata dal
+       worker o una presigned GET di ritorno. Le credenziali nel corpo della
+       richiesta restano memorizzate nel record del job lato RunPod: usare le
+       variabili d'ambiente dell'endpoint.
+    In nessun caso le credenziali vengono rimandate indietro nella risposta.
 """
 import asyncio
 import base64
@@ -38,6 +58,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
+import urllib.request
+import uuid
 import wave
 
 import numpy as np
@@ -56,7 +79,17 @@ DEFAULT_CONCURRENCY = int(os.environ.get("ABM_VOXCPM_CONCURRENCY", "16"))
 DEFAULT_CFG = float(os.environ.get("ABM_VOXCPM_CFG", "2.0"))
 SAMPLE_RATE_FALLBACK = 48000
 # Oltre questa soglia il PCM non torna nella risposta JSON ma va su S3.
+# A 48 kHz mono 16 bit sono 96 kB al secondo: 6 MB fanno ~62 secondi di audio.
 MAX_INLINE_BYTES = int(os.environ.get("ABM_VOXCPM_MAX_INLINE_BYTES", "6000000"))
+# Prefisso delle chiavi generate dal worker quando il chiamante non ne passa
+# una. Namespacing esplicito: il bucket e' condiviso con il tiering dell'app.
+S3_AUTO_PREFIX = os.environ.get("ABM_VOXCPM_S3_PREFIX", "voxcpm").strip("/")
+# Durata della presigned GET restituita al chiamante. Sei ore: il tempo di
+# scaricare un capitolo e ritentare qualche volta, non di condividerlo.
+S3_PRESIGN_TTL = int(os.environ.get("ABM_S3_PRESIGN_TTL_SEC", "21600"))
+# Tentativi per la PUT su presigned URL. La firma ha una scadenza: ritentare
+# a lungo non ha senso, oltre un certo punto l'URL e' morto comunque.
+S3_PUT_ATTEMPTS = int(os.environ.get("ABM_VOXCPM_S3_PUT_ATTEMPTS", "3"))
 # Limite per chunk. 300 char e' il valore usato nei test di qualita': testi
 # piu' lunghi allungano il contesto autoregressivo senza migliorare la resa.
 DEFAULT_MAX_CHARS = int(os.environ.get("ABM_VOXCPM_CHUNK_MAX_CHARS", "300"))
@@ -235,22 +268,207 @@ def _to_wav(pcm, sample_rate):
     return buf.getvalue()
 
 
-def _upload_s3(data, cfg):
-    """Carica su S3/R2 e restituisce la chiave. cfg: bucket/key/endpoint_url."""
-    import boto3
-    client = boto3.client(
-        "s3",
-        endpoint_url=cfg.get("endpoint_url") or os.environ.get("ABM_S3_ENDPOINT"),
-        aws_access_key_id=(cfg.get("access_key")
-                           or os.environ.get("ABM_S3_ACCESS_KEY")),
-        aws_secret_access_key=(cfg.get("secret_key")
-                               or os.environ.get("ABM_S3_SECRET_KEY")),
-        region_name=cfg.get("region") or os.environ.get("ABM_S3_REGION", "auto"),
+# ---------------------------------------------------------------------------
+# Consegna su S3/R2
+# ---------------------------------------------------------------------------
+_S3_CLIENT = None
+_S3_CLIENT_IDENT = None
+_S3_LOCK = threading.Lock()
+
+
+def _s3_conf(cfg):
+    """Configurazione S3: prima i campi della richiesta, poi le ABM_S3_*.
+
+    L'ordine e' quello e non il contrario perche' un job deve poter puntare a
+    un bucket diverso da quello di default dell'endpoint senza riconfigurarlo.
+    """
+    cfg = cfg or {}
+
+    def pick(field, env, default=""):
+        v = cfg.get(field)
+        if v is None or v == "":
+            v = os.environ.get(env, default)
+        return str(v).strip()
+
+    return {
+        "endpoint_url": pick("endpoint_url", "ABM_S3_ENDPOINT"),
+        "access_key": pick("access_key", "ABM_S3_ACCESS_KEY"),
+        "secret_key": pick("secret_key", "ABM_S3_SECRET_KEY"),
+        "bucket": pick("bucket", "ABM_S3_BUCKET"),
+        # "auto" e' il valore che vuole Cloudflare R2; per gli altri provider
+        # S3-compatibili la regione va passata esplicitamente.
+        "region": pick("region", "ABM_S3_REGION", "auto") or "auto",
+        "prefix": pick("key_prefix", "ABM_S3_KEY_PREFIX").strip("/"),
+        "ttl": int(cfg.get("presign_ttl") or S3_PRESIGN_TTL),
+    }
+
+
+def _s3_ready(conf):
+    return all(conf[k] for k in
+               ("endpoint_url", "access_key", "secret_key", "bucket"))
+
+
+def _s3_missing(conf):
+    return [k for k in ("endpoint_url", "access_key", "secret_key", "bucket")
+            if not conf[k]]
+
+
+def _s3_client(conf):
+    """Client boto3 riusato fra le chiamate, ricostruito solo se cambia il target.
+
+    Costruirlo a ogni upload significa ririsolvere l'endpoint e ricreare il
+    pool di connessioni: su un capitolo da decine di MB e' spreco puro.
+    signature_version s3v4 esplicito perche' R2 accetta solo quella.
+    """
+    global _S3_CLIENT, _S3_CLIENT_IDENT
+    ident = (conf["endpoint_url"], conf["access_key"], conf["bucket"],
+             conf["region"])
+    with _S3_LOCK:
+        if _S3_CLIENT is None or _S3_CLIENT_IDENT != ident:
+            import boto3
+            from botocore.config import Config
+            _S3_CLIENT = boto3.client(
+                "s3",
+                endpoint_url=conf["endpoint_url"],
+                aws_access_key_id=conf["access_key"],
+                aws_secret_access_key=conf["secret_key"],
+                region_name=conf["region"],
+                config=Config(signature_version="s3v4",
+                              retries={"max_attempts": 3, "mode": "standard"}),
+            )
+            _S3_CLIENT_IDENT = ident
+    return _S3_CLIENT
+
+
+def _s3_full_key(conf, key):
+    k = key.lstrip("/")
+    return f"{conf['prefix']}/{k}" if conf["prefix"] else k
+
+
+def _s3_put_signed(put_url, data, content_type):
+    """Carica su una presigned PUT firmata dal chiamante. Nessuna credenziale.
+
+    Ritentato perche' un capitolo sono decine di MB su una connessione che puo'
+    cadere, e rigenerare l'audio costa GPU mentre ritentare la PUT costa banda.
+    Non si ritenta sui 4xx: una firma scaduta o una chiave sbagliata non
+    diventano valide riprovando.
+    """
+    last = None
+    for attempt in range(S3_PUT_ATTEMPTS):
+        try:
+            req = urllib.request.Request(
+                put_url, data=data, method="PUT",
+                headers={"Content-Type": content_type,
+                         "Content-Length": str(len(data))})
+            with urllib.request.urlopen(req, timeout=300) as r:
+                return {"status": r.status, "bytes": len(data)}
+        except urllib.error.HTTPError as e:
+            body = ""
+            try:
+                body = e.read()[:500].decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                pass
+            if 400 <= e.code < 500:
+                raise RuntimeError(
+                    f"presigned PUT rifiutata con {e.code}: {body}") from e
+            last = f"HTTP {e.code}: {body}"
+        except Exception as e:  # noqa: BLE001
+            last = f"{type(e).__name__}: {e}"
+        print(f"[worker] PUT tentativo {attempt + 1} fallito ({last})",
+              flush=True)
+        time.sleep(2 ** attempt)
+    raise RuntimeError(f"presigned PUT fallita dopo {S3_PUT_ATTEMPTS} "
+                       f"tentativi: {last}")
+
+
+def _s3_upload(data, conf, key, content_type):
+    """Carica con credenziali complete e restituisce una presigned GET.
+
+    upload_fileobj e non put_object: sopra la soglia boto3 passa da solo al
+    multipart, che su decine di MB e' ritentabile a pezzi invece che da capo.
+    """
+    from boto3.s3.transfer import TransferConfig
+    client = _s3_client(conf)
+    full = _s3_full_key(conf, key)
+    t0 = time.time()
+    client.upload_fileobj(
+        io.BytesIO(data), conf["bucket"], full,
+        ExtraArgs={"ContentType": content_type},
+        Config=TransferConfig(multipart_threshold=8 * 1024 * 1024,
+                              multipart_chunksize=8 * 1024 * 1024,
+                              max_concurrency=4),
     )
-    bucket = cfg.get("bucket") or os.environ["ABM_S3_BUCKET"]
-    key = cfg["key"]
-    client.put_object(Bucket=bucket, Key=key, Body=data)
-    return {"bucket": bucket, "key": key}
+    out = {"bucket": conf["bucket"], "key": full, "bytes": len(data),
+           "upload_seconds": round(time.time() - t0, 2)}
+    try:
+        # L'URL firmato e' l'unica parte utile al chiamante: senza, riceverebbe
+        # una chiave che non puo' leggere. E' a scadenza, e le credenziali non
+        # lasciano mai il worker.
+        out["url"] = client.generate_presigned_url(
+            "get_object", Params={"Bucket": conf["bucket"], "Key": full},
+            ExpiresIn=conf["ttl"])
+        out["url_expires_in"] = conf["ttl"]
+    except Exception as e:  # noqa: BLE001 — l'oggetto e' caricato comunque
+        out["presign_error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _deliver_audio(out, payload, inp, job_id, ext, content_type):
+    """Decide come consegnare l'audio e annota l'esito in `out`.
+
+    Regola: se il chiamante indica una destinazione la si usa sempre, anche per
+    audio piccolo; altrimenti si va inline finche' ci sta e si passa a S3 solo
+    quando serve. Cosi' le prove manuali restano a una sola chiamata e i
+    capitoli veri non sbattono contro il limite.
+
+    Attenzione: RunPod marca FAILED qualunque job la cui uscita contenga la
+    chiave `error`. Va scritta solo quando l'audio non e' stato consegnato.
+    """
+    s3cfg = inp.get("s3") or {}
+    put_url = s3cfg.get("put_url")
+    key = s3cfg.get("key")
+    conf = _s3_conf(s3cfg)
+    too_big = len(payload) > MAX_INLINE_BYTES
+
+    if put_url:
+        try:
+            res = _s3_put_signed(put_url, payload, content_type)
+            # L'URL firmato NON viene rimandato indietro: contiene la firma di
+            # scrittura ed e' gia' noto a chi l'ha generato.
+            out["s3"] = dict(res, mode="put_url", key=key or None)
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"upload su presigned PUT fallito: {e}"
+        return
+
+    if key or (too_big and _s3_ready(conf)):
+        if not _s3_ready(conf):
+            out["error"] = (
+                "'s3.key' richiesto ma configurazione S3 incompleta, mancano: "
+                + ", ".join(_s3_missing(conf))
+                + ". Impostare le ABM_S3_* sull'endpoint oppure passare "
+                  "'s3.put_url' (presigned PUT, nessuna credenziale)")
+            return
+        if not key:
+            # Chiave sull'id del job: un job = un capitolo, quindi e' univoca
+            # e permette di risalire dal file al job che l'ha prodotto.
+            key = f"{S3_AUTO_PREFIX}/{job_id or uuid.uuid4().hex}.{ext}"
+            out["s3_key_generated"] = True
+        try:
+            out["s3"] = dict(_s3_upload(payload, conf, key, content_type),
+                             mode="credentials")
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"upload S3 fallito: {type(e).__name__}: {e}"
+        return
+
+    if not too_big:
+        out["audio_b64"] = base64.b64encode(payload).decode("ascii")
+        return
+
+    out["error"] = (
+        f"audio di {len(payload):,} byte oltre il limite inline di "
+        f"{MAX_INLINE_BYTES:,} e nessuna destinazione S3 configurata: passare "
+        f"'s3.put_url' (presigned PUT) oppure impostare le ABM_S3_* "
+        f"sull'endpoint")
 
 
 _SENTENCE_END = re.compile(r"(?<=[.!?;:…])\s+|\n+")
@@ -363,7 +581,7 @@ def _action_encode_voice(inp):
     }
 
 
-def _action_generate(inp):
+def _action_generate(inp, job_id=""):
     max_chars = int(inp.get("max_chars", DEFAULT_MAX_CHARS))
     chunks = inp.get("chunks") or []
     if not chunks:
@@ -437,17 +655,14 @@ def _action_generate(inp):
     }
 
     fmt = (inp.get("output_format") or "wav").lower()
-    payload = _to_wav(pcm, _SAMPLE_RATE) if fmt == "wav" else pcm
-    out["format"] = fmt
-
-    s3cfg = inp.get("s3")
-    if s3cfg and s3cfg.get("key"):
-        out["s3"] = _upload_s3(payload, s3cfg)
-    elif len(payload) <= MAX_INLINE_BYTES:
-        out["audio_b64"] = base64.b64encode(payload).decode("ascii")
+    if fmt == "wav":
+        payload, ext, ctype = _to_wav(pcm, _SAMPLE_RATE), "wav", "audio/wav"
     else:
-        out["error"] = (f"audio di {len(payload):,} byte oltre il limite inline "
-                        f"di {MAX_INLINE_BYTES:,}: fornire 's3' con 'key'")
+        payload, ext, ctype = pcm, "pcm", "application/octet-stream"
+    out["format"] = fmt
+    out["bytes"] = len(payload)
+
+    _deliver_audio(out, payload, inp, job_id, ext, ctype)
     return out
 
 
@@ -577,6 +792,50 @@ def _probe_weights():
         found, key=lambda d: -d["gb"])[:20]}
 
 
+def _probe_s3(cfg):
+    """Giro completo put/head/presign/delete su un oggetto minuscolo.
+
+    Verificare le credenziali qui costa una frazione di secondo; scoprirle
+    sbagliate dopo aver sintetizzato un capitolo costa minuti di GPU e l'audio,
+    che a quel punto e' gia' stato prodotto e viene buttato.
+    Non riporta MAI access_key/secret_key: la risposta torna al chiamante.
+    """
+    conf = _s3_conf(cfg)
+    info = {"configured": _s3_ready(conf),
+            "endpoint_url": conf["endpoint_url"],
+            "bucket": conf["bucket"],
+            "region": conf["region"],
+            "key_prefix": conf["prefix"],
+            "auto_prefix": S3_AUTO_PREFIX}
+    if not info["configured"]:
+        info["missing"] = _s3_missing(conf)
+        return info
+
+    client = _s3_client(conf)
+    key = _s3_full_key(conf, f"{S3_AUTO_PREFIX}/_probe/{uuid.uuid4().hex}.txt")
+    blob = b"abm-voxcpm probe"
+    t0 = time.time()
+    client.put_object(Bucket=conf["bucket"], Key=key, Body=blob,
+                      ContentType="text/plain")
+    info["put_seconds"] = round(time.time() - t0, 3)
+    head = client.head_object(Bucket=conf["bucket"], Key=key)
+    info["head_bytes"] = int(head["ContentLength"])
+    info["size_ok"] = info["head_bytes"] == len(blob)
+    url = client.generate_presigned_url(
+        "get_object", Params={"Bucket": conf["bucket"], "Key": key},
+        ExpiresIn=60)
+    # Solo la forma dell'URL: il valore intero contiene la firma e non serve
+    # a chi legge la diagnostica.
+    info["presign_ok"] = url.startswith("http") and "X-Amz-Signature" in url
+    try:
+        client.delete_object(Bucket=conf["bucket"], Key=key)
+        info["cleanup_ok"] = True
+    except Exception as e:  # noqa: BLE001 — resta un oggetto da 16 byte
+        info["cleanup_ok"] = False
+        info["cleanup_error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
 def _action_diag(inp):
     """Sonde a stadi. Diagnostica che torna al chiamante, non nei log.
 
@@ -592,6 +851,10 @@ def _action_diag(inp):
     _stage(stages, "model_path", _probe_model_path)
     if inp.get("weights"):
         _stage(stages, "weights", _probe_weights)
+    # Esplicito e non automatico: scrive davvero sul bucket, e una diagnostica
+    # non deve avere effetti collaterali che il chiamante non ha chiesto.
+    if inp.get("s3_check"):
+        _stage(stages, "s3", lambda: _probe_s3(inp.get("s3")))
     # Lo stadio caro e' esplicito: le sonde sopra costano secondi, questo
     # costa minuti di GPU e puo' far morire il processo.
     if inp.get("build"):
@@ -609,7 +872,10 @@ def _handle(job):
         if action == "encode_voice":
             return _action_encode_voice(inp)
         if action == "generate":
-            return _action_generate(inp)
+            # L'id del job serve a generare la chiave S3 quando il chiamante
+            # non ne passa una: e' l'unico identificatore che lega il file al
+            # lavoro che l'ha prodotto.
+            return _action_generate(inp, str(job.get("id") or ""))
         if action == "diag":
             return _action_diag(inp)
         if action == "health":
