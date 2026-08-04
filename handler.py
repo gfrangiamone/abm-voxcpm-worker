@@ -134,6 +134,28 @@ def _heartbeat(label, every=10.0):
               flush=True)
 
 
+def _resolve_model_path(spec):
+    """Da repo id HuggingFace a directory locale.
+
+    VoxCPM2ServerImpl fa os.path.join(model_path, "config.json"): vuole una
+    CARTELLA, non un repo id. Passando "openbmb/VoxCPM2" cercava
+    "openbmb/VoxCPM2/config.json" relativo alla cwd — misurato, FileNotFoundError.
+
+    I pesi sono gia' nell'immagine (snapshot_download in fase di build), quindi
+    si prova prima local_files_only: senza, un errore di cache si tradurrebbe in
+    5 GB scaricati a runtime, pagati a GPU accesa.
+    """
+    if os.path.isdir(spec):
+        return spec
+    from huggingface_hub import snapshot_download
+    try:
+        return snapshot_download(spec, local_files_only=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[worker] pesi non in cache ({type(e).__name__}), scarico da HF",
+              flush=True)
+        return snapshot_download(spec)
+
+
 async def _build_pool():
     """Costruisce il pool DENTRO il loop dedicato.
 
@@ -141,29 +163,21 @@ async def _build_pool():
     propri task di background sul loop attivo al momento della creazione: se
     nascesse sul loop dell'handler, quei task morirebbero con la chiamata.
     """
-    try:
-        from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2ServerPool
-        pool = AsyncVoxCPM2ServerPool(
-            model_path=MODEL_PATH,
-            inference_timesteps=TIMESTEPS,
-            max_num_seqs=MAX_NUM_SEQS,
-            gpu_memory_utilization=GPU_MEM_UTIL,
-            devices=[0],
-        )
-    except ImportError:
-        from nanovllm_voxcpm import VoxCPM
-        pool = VoxCPM.from_pretrained(
-            model=MODEL_PATH,
-            inference_timesteps=TIMESTEPS,
-            max_num_seqs=MAX_NUM_SEQS,
-            gpu_memory_utilization=GPU_MEM_UTIL,
-            devices=[0],
-        )
-    # Il ripiego VoxCPM.from_pretrained quasi certamente non espone
-    # wait_for_ready: e' un'API del pool asincrono, non del wrapper sincrono.
-    waiter = getattr(pool, "wait_for_ready", None)
-    if waiter is not None:
-        await waiter()
+    model_dir = _resolve_model_path(MODEL_PATH)
+    print(f"[worker] pesi in {model_dir}", flush=True)
+    # Nessun ripiego su VoxCPM.from_pretrained: la presenza di
+    # AsyncVoxCPM2ServerPool e' verificata sul worker (nanovllm-voxcpm 2.0.3),
+    # e il wrapper sincrono romperebbe comunque piu' avanti — encode_latents e
+    # generate sono usati qui come API asincrone. Meglio un ImportError netto.
+    from nanovllm_voxcpm.models.voxcpm2.server import AsyncVoxCPM2ServerPool
+    pool = AsyncVoxCPM2ServerPool(
+        model_path=model_dir,
+        inference_timesteps=TIMESTEPS,
+        max_num_seqs=MAX_NUM_SEQS,
+        gpu_memory_utilization=GPU_MEM_UTIL,
+        devices=[0],
+    )
+    await pool.wait_for_ready()
     return pool
 
 
@@ -539,6 +553,14 @@ def _probe_nanovllm():
     return info
 
 
+def _probe_model_path():
+    """Risolve i pesi senza costruire nulla: e' l'errore che ha fermato il build."""
+    d = _resolve_model_path(MODEL_PATH)
+    return {"spec": MODEL_PATH, "dir": d, "is_dir": os.path.isdir(d),
+            "has_config": os.path.isfile(os.path.join(d, "config.json")),
+            "entries": sorted(os.listdir(d))[:40] if os.path.isdir(d) else []}
+
+
 def _probe_weights():
     root = os.environ.get("HF_HOME", "/opt/hf")
     found = []
@@ -567,6 +589,7 @@ def _action_diag(inp):
     _stage(stages, "torch", _probe_torch)
     _stage(stages, "flash_attn", _probe_flash_attn)
     _stage(stages, "nanovllm", _probe_nanovllm)
+    _stage(stages, "model_path", _probe_model_path)
     if inp.get("weights"):
         _stage(stages, "weights", _probe_weights)
     # Lo stadio caro e' esplicito: le sonde sopra costano secondi, questo
