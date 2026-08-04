@@ -28,12 +28,16 @@ VOCE DI RIFERIMENTO — due modi, entrambi accettati
 """
 import asyncio
 import base64
+import contextlib
 import hashlib
 import io
 import os
 import re
+import shutil
+import sys
 import threading
 import time
+import traceback
 import wave
 
 import numpy as np
@@ -59,6 +63,10 @@ DEFAULT_MAX_CHARS = int(os.environ.get("ABM_VOXCPM_CHUNK_MAX_CHARS", "300"))
 # Quante voci tenere in cache sul worker caldo. Ogni voce sono pochi KB di
 # latenti: il tetto serve solo a evitare crescita illimitata.
 LATENT_CACHE_MAX = int(os.environ.get("ABM_VOXCPM_LATENT_CACHE", "32"))
+# Tetto alla costruzione del pool. Serve a trasformare un blocco indefinito in
+# un errore leggibile dal chiamante: un job appeso costa GPU fino all'execution
+# timeout dell'endpoint e non lascia nulla da leggere.
+BUILD_TIMEOUT = float(os.environ.get("ABM_VOXCPM_BUILD_TIMEOUT", "420"))
 
 _POOL = None
 _LOOP = None
@@ -97,6 +105,33 @@ def _await(coro):
                 _LOOP_THREAD.start()
                 _LOOP = loop
     return asyncio.run_coroutine_threadsafe(coro, _LOOP).result()
+
+
+@contextlib.contextmanager
+def _heartbeat(label, every=10.0):
+    """Stampa una riga ogni `every` secondi finche' il blocco e' attivo.
+
+    Serve a diagnosticare le morti silenziose: se il processo viene ucciso
+    senza traccia (OOM killer, abort a livello C), l'ultima riga stampata dice
+    a che secondo e' successo. Senza questo, fra l'avvio del worker e la morte
+    non c'e' NULLA da leggere nei log.
+    """
+    stop = threading.Event()
+    t0 = time.time()
+
+    def _tick():
+        while not stop.wait(every):
+            print(f"[worker] {label}: {time.time() - t0:.0f}s in corso",
+                  flush=True)
+
+    th = threading.Thread(target=_tick, name=f"hb-{label}", daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        print(f"[worker] {label}: uscita dopo {time.time() - t0:.1f}s",
+              flush=True)
 
 
 async def _build_pool():
@@ -141,7 +176,14 @@ def _pool():
         if _POOL is not None:
             return _POOL
         t0 = time.time()
-        pool = _await(_build_pool())
+        print(f"[worker] costruzione pool: model={MODEL_PATH} "
+              f"timesteps={TIMESTEPS} max_num_seqs={MAX_NUM_SEQS} "
+              f"gpu_mem_util={GPU_MEM_UTIL}", flush=True)
+        with _heartbeat("build"):
+            # wait_for e non attesa nuda: senza tetto un blocco nel caricamento
+            # del modello resta appeso fino all'execution timeout dell'endpoint,
+            # e il chiamante riceve un timeout generico invece di un errore.
+            pool = _await(asyncio.wait_for(_build_pool(), timeout=BUILD_TIMEOUT))
         try:
             info = _await(pool.get_model_info())
             _SAMPLE_RATE = int(getattr(info, "sample_rate", SAMPLE_RATE_FALLBACK))
@@ -395,23 +437,177 @@ def _action_generate(inp):
     return out
 
 
-def handler(job):
+def _stage(out, name, fn):
+    """Esegue una sonda diagnostica isolata e ne registra l'esito.
+
+    Ogni sonda e' cronometrata e racchiusa nel proprio try/except: una che
+    fallisce non impedisce alle successive di girare, e stdout/stderr prodotti
+    dalle librerie (che nella console RunPod non si vedono) finiscono nella
+    risposta JSON. E' l'unico canale diagnostico affidabile che abbiamo.
+    """
+    buf = io.StringIO()
+    t0 = time.time()
+    entry = {}
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            entry["result"] = fn()
+        entry["ok"] = True
+    except BaseException as e:  # noqa: BLE001 — anche SystemExit va riportato
+        entry["ok"] = False
+        entry["error"] = f"{type(e).__name__}: {e}"
+        entry["traceback"] = traceback.format_exc()[-4000:]
+    entry["seconds"] = round(time.time() - t0, 2)
+    captured = buf.getvalue()
+    if captured:
+        entry["stdout"] = captured[-4000:]
+    out[name] = entry
+    # Ristampato sul vero stdout: se il processo muore alla sonda successiva,
+    # nei log resta almeno il punto raggiunto.
+    print(f"[worker] diag/{name}: ok={entry['ok']} "
+          f"{entry['seconds']}s", flush=True)
+    return entry
+
+
+def _probe_env():
+    import platform
+    du = shutil.disk_usage("/")
+    mem = {}
+    try:
+        with open("/proc/meminfo", "r", encoding="ascii") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable"):
+                    mem[k] = v.strip()
+    except OSError:
+        pass
+    return {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "cwd": os.getcwd(),
+        "disk_free_gb": round(du.free / 1e9, 2),
+        "disk_total_gb": round(du.total / 1e9, 2),
+        "meminfo": mem,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        # Solo ABM_VOXCPM_* e solo se non somigliano a un segreto: la risposta
+        # viaggia fino al chiamante e finisce nei suoi log. Un "dammi tutte le
+        # ABM_*" qui esporrebbe chiavi API e password SMTP.
+        "abm_env": {k: v for k, v in sorted(os.environ.items())
+                    if k.startswith("ABM_VOXCPM_")
+                    and not re.search(r"KEY|SECRET|PASS|TOKEN", k)},
+    }
+
+
+def _probe_torch():
+    import torch
+    info = {
+        "version": torch.__version__,
+        "cuda_build": torch.version.cuda,
+        "is_available": torch.cuda.is_available(),
+        "device_count": torch.cuda.device_count(),
+    }
+    if info["device_count"]:
+        info["device_name"] = torch.cuda.get_device_name(0)
+        free, total = torch.cuda.mem_get_info(0)
+        info["vram_free_gb"] = round(free / 1e9, 2)
+        info["vram_total_gb"] = round(total / 1e9, 2)
+        # Allocazione reale: is_available() puo' dire True e poi fallire
+        # all'inizializzazione del contesto CUDA.
+        t = torch.zeros(1024, 1024, device="cuda")
+        info["alloc_test"] = float(t.sum().item())
+    return info
+
+
+def _probe_flash_attn():
+    import flash_attn
+    return {"version": getattr(flash_attn, "__version__", "?"),
+            "file": getattr(flash_attn, "__file__", "?")}
+
+
+def _probe_nanovllm():
+    import nanovllm_voxcpm
+    info = {
+        "version": getattr(nanovllm_voxcpm, "__version__", "?"),
+        "file": getattr(nanovllm_voxcpm, "__file__", "?"),
+        "has_VoxCPM": hasattr(nanovllm_voxcpm, "VoxCPM"),
+    }
+    try:
+        from nanovllm_voxcpm.models.voxcpm2 import server as _srv
+        info["server_module"] = getattr(_srv, "__file__", "?")
+        info["exports"] = [n for n in dir(_srv) if not n.startswith("_")]
+    except Exception as e:  # noqa: BLE001
+        info["server_module_error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def _probe_weights():
+    root = os.environ.get("HF_HOME", "/opt/hf")
+    found = []
+    for base, _sub, files in os.walk(root):
+        for fn in files:
+            p = os.path.join(base, fn)
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if sz > 50_000_000:
+                found.append({"path": p, "gb": round(sz / 1e9, 2)})
+    return {"hf_home": root, "big_files": sorted(
+        found, key=lambda d: -d["gb"])[:20]}
+
+
+def _action_diag(inp):
+    """Sonde a stadi. Diagnostica che torna al chiamante, non nei log.
+
+    La console RunPod non mostra NULLA dell'applicazione: i tre health falliti
+    hanno prodotto solo righe dell'infrastruttura. Questa azione porta la stessa
+    informazione nel corpo della risposta HTTP, dove e' leggibile.
+    """
+    stages = {}
+    _stage(stages, "env", _probe_env)
+    _stage(stages, "torch", _probe_torch)
+    _stage(stages, "flash_attn", _probe_flash_attn)
+    _stage(stages, "nanovllm", _probe_nanovllm)
+    if inp.get("weights"):
+        _stage(stages, "weights", _probe_weights)
+    # Lo stadio caro e' esplicito: le sonde sopra costano secondi, questo
+    # costa minuti di GPU e puo' far morire il processo.
+    if inp.get("build"):
+        _stage(stages, "build", lambda: {
+            "sample_rate": (_pool(), _SAMPLE_RATE)[1]})
+    return {"ok": all(s.get("ok") for s in stages.values()),
+            "stages": stages}
+
+
+def _handle(job):
     inp = job.get("input") or {}
     action = inp.get("action", "generate")
+    print(f"[worker] job ricevuto action={action}", flush=True)
     try:
         if action == "encode_voice":
             return _action_encode_voice(inp)
         if action == "generate":
             return _action_generate(inp)
+        if action == "diag":
+            return _action_diag(inp)
         if action == "health":
             _pool()
             return {"ok": True, "sample_rate": _SAMPLE_RATE,
                     "timesteps": TIMESTEPS}
         return {"error": f"azione sconosciuta: {action}"}
     except Exception as e:  # noqa: BLE001 — l'errore deve tornare al chiamante
-        import traceback
         traceback.print_exc()
-        return {"error": f"{type(e).__name__}: {e}"}
+        return {"error": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc()[-4000:]}
+
+
+async def handler(job):
+    """Sposta il lavoro bloccante fuori dal loop dell'SDK.
+
+    _handle blocca (costruzione pool, attese sul loop dedicato). Se bloccasse
+    il loop su cui gira il worker RunPod, l'SDK non potrebbe piu' rispondere
+    alle proprie chiamate di controllo per tutta la durata del job.
+    """
+    return await asyncio.get_running_loop().run_in_executor(None, _handle, job)
 
 
 runpod.serverless.start({"handler": handler})
