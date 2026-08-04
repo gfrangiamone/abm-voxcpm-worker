@@ -84,6 +84,40 @@ ENV ABM_VOXCPM_TIMESTEPS=10 \
     ABM_VOXCPM_CFG=2.0 \
     ABM_VOXCPM_GPU_MEM_UTIL=0.9
 
+# Compilatore C per Triton. Il motore usa torch.compile: Inductor genera
+# kernel Triton e li COMPILA a runtime, al warmup del modello. Senza gcc/g++
+# il pool muore con "InductorError: Failed to find C compiler" — misurato sul
+# worker. La base e' l'immagine `runtime` (non `devel`) perche' flash-attn
+# arriva come wheel gia' compilata, ma questo non copre la compilazione dei
+# kernel a runtime.
+#
+# Volutamente DOPO il layer dei pesi: messo insieme all'apt-get iniziale
+# invaliderebbe la cache di tutto cio' che segue, cioe' 5 GB di pesi
+# riscaricati da HuggingFace a ogni modifica dell'immagine.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gcc g++ \
+ && rm -rf /var/lib/apt/lists/* \
+ && gcc --version | head -1
+
+# Triton non compila un .c qualunque: compila un modulo di estensione Python,
+# quindi servono anche gli header (Python.h). Verificarlo qui costa nulla;
+# scoprirlo a runtime costa un job GPU e un giro di release.
+RUN python - <<'PY'
+import subprocess, sysconfig, tempfile, os, sys
+inc = sysconfig.get_paths()["include"]
+src = "#include <Python.h>\nint main(void){ return 0; }\n"
+with tempfile.TemporaryDirectory() as d:
+    c = os.path.join(d, "t.c")
+    open(c, "w").write(src)
+    r = subprocess.run(["gcc", "-I", inc, c, "-o", os.path.join(d, "t")],
+                       capture_output=True, text=True)
+    print("include dir:", inc)
+    if r.returncode:
+        print(r.stderr)
+        sys.exit("gcc non compila contro Python.h")
+    print("gcc + Python.h ok")
+PY
+
 COPY handler.py /app/handler.py
 
 CMD ["python", "-u", "/app/handler.py"]
